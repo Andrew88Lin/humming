@@ -1310,6 +1310,13 @@ def _moe_ctas_per_sm(
     resource_limit = min(resource_limit, analysis.thread_smem_cta_limit)
     if problem.device.num_sms is None:
         raise ValueError("MoE selection requires a device SM count")
+    if is_grouped_indexed and not problem.use_batch_invariant and resource_limit == 3:
+        has_full_waves = analysis.num_output_tiles >= 2 * resource_limit * problem.device.num_sms
+        has_long_reduction = problem.layer_config.shape_k > 2 * block_shape[2] * analysis.candidate.num_stages
+        padded_work = analysis.num_output_tiles * math.prod(block_shape[:2])
+        has_sparse_tiles = 4 * problem.shape_m * problem.layer_config.shape_n < padded_work
+        if not has_full_waves or (has_long_reduction and has_sparse_tiles):
+            resource_limit = 2
     grid_limit = math.ceil(analysis.num_output_tiles / problem.device.num_sms)
     return max(1, min(resource_limit, grid_limit))
 
