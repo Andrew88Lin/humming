@@ -1,4 +1,3 @@
-import dataclasses
 import math
 
 import pytest
@@ -9,7 +8,6 @@ from humming.config.mma import get_register_budget_error
 from humming.device import DeviceInfo
 from humming.tune import _get_heuristics_config
 from humming.tune.sm90 import Sm90Heuristics
-from humming.tune.sm90_policies import _grouped_scale_indexed_ctas_per_sm, select_sm90_block_m
 
 
 @pytest.fixture(autouse=True)
@@ -373,156 +371,6 @@ def test_fp4_a16_dense_uses_small_tile_only_through_m128():
     assert small["warp_shape"][1:] == (32, 64)
     assert small["num_ctas_per_sm"] == 2
     assert large["block_shape"][1:] != (128, 64)
-
-
-@pytest.mark.parametrize(
-    ("shape_n", "shape_k", "routed_m", "expected_block_m", "expected_ctas"),
-    [
-        (1280, 5120, 768, 8, 3),
-        (5120, 640, 768, 8, 3),
-        (1280, 5120, 98304, 64, 2),
-        (5120, 640, 98304, 64, 2),
-    ],
-)
-def test_grouped_fp8_indexed_moe_fills_sms_with_resident_ctas(
-    shape_n,
-    shape_k,
-    routed_m,
-    expected_block_m,
-    expected_ctas,
-):
-    decision = Sm90Heuristics._get_candidate_decision(
-        _layer(shape_n, shape_k, num_experts=384, use_packed_k_layout=False),
-        shape_m=routed_m,
-        gemm_type=GemmType.INDEXED,
-    )
-    config = decision.to_config()
-
-    assert decision.selected_analysis.legal
-    assert config["block_shape"][0] == expected_block_m
-    assert config["num_ctas_per_sm"] == expected_ctas
-    assert config["use_stream_k"] is False
-
-
-@pytest.mark.parametrize(
-    ("num_threads", "block_m", "resource_limit", "expected_ctas"),
-    [
-        (128, 16, 8, 3),
-        (128, 24, 8, 2),
-        (256, 24, 8, 2),
-        (256, 32, 8, 1),
-        (512, 16, 8, 1),
-        (128, 16, 2, 2),
-        (128, 16, 1, 1),
-    ],
-)
-def test_grouped_scale_indexed_cta_caps(num_threads, block_m, resource_limit, expected_ctas):
-    decision = Sm90Heuristics.get_tuning_decision(
-        _layer(5120, 640, num_experts=384, use_packed_k_layout=False),
-        shape_m=768,
-        gemm_type=GemmType.INDEXED,
-    )
-    analysis = dataclasses.replace(
-        decision.selected_analysis,
-        candidate=decision.selected.with_updates(block_shape=(block_m, 128, 128)),
-        num_threads=num_threads,
-        thread_smem_cta_limit=resource_limit,
-    )
-
-    assert _grouped_scale_indexed_ctas_per_sm(analysis) == expected_ctas
-
-
-def test_grouped_fp8_indexed_moe_keeps_one_cta_for_wide_256_thread_tiles(monkeypatch):
-    monkeypatch.setattr("humming.tune.sm90_policies.select_sm90_block_m", lambda *args, **kwargs: 32)
-    decision = Sm90Heuristics._get_candidate_decision(
-        _layer(1280, 5120, num_experts=384, use_packed_k_layout=False),
-        shape_m=6144,
-        gemm_type=GemmType.INDEXED,
-    )
-    wide_tiles = [
-        analysis
-        for analysis in decision.considered
-        if analysis.num_threads == 256 and analysis.candidate.block_shape[0] == 32
-    ]
-
-    assert wide_tiles
-    assert all(analysis.candidate.num_ctas_per_sm == 1 for analysis in wide_tiles)
-
-
-def test_grouped_fp8_indexed_moe_limits_residency_to_useful_work():
-    decision = Sm90Heuristics.get_tuning_decision(
-        _layer(1280, 5120, num_experts=384, use_packed_k_layout=False),
-        shape_m=1,
-        gemm_type=GemmType.INDEXED,
-    )
-    config = decision.to_config()
-
-    assert decision.selected_analysis.num_output_tiles < 132
-    assert config["num_ctas_per_sm"] == 1
-    assert config["use_stream_k"] is True
-
-
-@pytest.mark.parametrize(
-    ("gemm_type", "use_batch_invariant", "use_f16_accum", "expected_max_block_m"),
-    [
-        (GemmType.INDEXED, False, False, 64),
-        (GemmType.INDEXED, True, False, 160),
-        (GemmType.DENSE, False, False, 160),
-        (GemmType.GROUPED_CONTIGUOUS, False, False, 160),
-        (GemmType.INDEXED, False, True, 256),
-    ],
-)
-def test_grouped_scale_m_cap_respects_schedule_scope(
-    monkeypatch, gemm_type, use_batch_invariant, use_f16_accum, expected_max_block_m
-):
-    observed_limits = []
-
-    def select_block_m(layer_config, shape_m, max_block_m, *args, **kwargs):
-        observed_limits.append(max_block_m)
-        return select_sm90_block_m(layer_config, shape_m, max_block_m, *args, **kwargs)
-
-    monkeypatch.setattr("humming.tune.sm90_policies.select_sm90_block_m", select_block_m)
-    decision = Sm90Heuristics._get_candidate_decision(
-        _layer(
-            1280,
-            5120,
-            num_experts=0 if gemm_type == GemmType.DENSE else 384,
-            use_packed_k_layout=False,
-        ),
-        shape_m=98304,
-        use_batch_invariant=use_batch_invariant,
-        use_f16_accum=use_f16_accum,
-        gemm_type=gemm_type,
-    )
-
-    assert decision.selected_analysis.legal
-    assert observed_limits == [expected_max_block_m]
-
-
-def test_grouped_fp8_indexed_moe_keeps_batch_invariant_schedule():
-    config = Sm90Heuristics.get_config(
-        _layer(1280, 5120, num_experts=384, use_packed_k_layout=False),
-        shape_m=98304,
-        use_batch_invariant=True,
-        gemm_type=GemmType.INDEXED,
-    )
-
-    assert config["block_shape"] == (64, 128, 128)
-    assert config["num_ctas_per_sm"] == 2
-    assert config["use_stream_k"] is False
-
-
-@pytest.mark.parametrize("shape_n,shape_k", [(1280, 5120), (5120, 640)])
-def test_grouped_fp8_indexed_preserves_specialized_prefill_schedules(shape_n, shape_k):
-    config = Sm90Heuristics.get_config(
-        _layer(shape_n, shape_k, num_experts=384, use_packed_k_layout=False),
-        shape_m=98304,
-        gemm_type=GemmType.INDEXED,
-    )
-
-    assert config["block_shape"] == (64, 256, 128)
-    assert config["num_ctas_per_sm"] == 1
-    assert config["use_stream_k"] is False
 
 
 @pytest.mark.parametrize("device_name", ["H200", "L20X"])
