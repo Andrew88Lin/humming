@@ -264,8 +264,16 @@ def get_sm90_specialized_config(
         num_m_tiles = ((counts + block_m - 1) // block_m).sum(axis=1).mean()
         num_output_tiles = num_m_tiles * math.ceil(layer_config.shape_n / block_n)
         resident_ctas = current_device.sm_count * config.get("num_ctas_per_sm", 1)
-        # Large grids amortize the tail imbalance without splitting the K reduction.
-        if num_output_tiles >= 16 * resident_ctas:
+        has_short_packed_reduction = (
+            gemm_type == GemmType.INDEXED
+            and layer_config.use_packed_k_layout
+            and layer_config.is_group_input_scale
+            and layer_config.as_dtype == dtypes.float32
+            and layer_config.use_fused_e8m0_scale
+            and layer_config.shape_k <= 2 * config["block_shape"][2] * config["num_stages"]
+        )
+        # Short reductions favor avoiding fixups; large grids already amortize the tail.
+        if num_output_tiles >= 16 * resident_ctas or has_short_packed_reduction:
             return config | {"use_stream_k": False}
         return config
 
